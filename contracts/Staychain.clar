@@ -8,9 +8,19 @@
 (define-constant ERR_BOOKING_NOT_ACTIVE (err u106))
 (define-constant ERR_ALREADY_REVIEWED (err u107))
 (define-constant ERR_CANNOT_REVIEW_OWN_PROPERTY (err u108))
+(define-constant ERR_DISPUTE_NOT_FOUND (err u109))
+(define-constant ERR_DISPUTE_ALREADY_EXISTS (err u110))
+(define-constant ERR_INVALID_DISPUTE_STATUS (err u111))
+(define-constant ERR_NOT_DISPUTING_PARTY (err u112))
+(define-constant ERR_ALREADY_VOTED (err u113))
+(define-constant ERR_DISPUTE_NOT_OPEN (err u114))
+(define-constant ERR_INSUFFICIENT_ARBITRATOR_STAKE (err u115))
+(define-constant ERR_NOT_ARBITRATOR (err u116))
 
 (define-data-var next-property-id uint u1)
 (define-data-var next-booking-id uint u1)
+(define-data-var next-dispute-id uint u1)
+(define-data-var arbitrator-stake-required uint u1000000)
 
 (define-map properties
   { property-id: uint }
@@ -64,6 +74,49 @@
     host-rating: uint,
     guest-rating: uint
   }
+)
+
+(define-map disputes
+  { dispute-id: uint }
+  {
+    booking-id: uint,
+    initiator: principal,
+    respondent: principal,
+    dispute-type: (string-ascii 30),
+    description: (string-ascii 500),
+    evidence-hash: (string-ascii 64),
+    status: (string-ascii 20),
+    escrow-amount: uint,
+    created-at: uint,
+    resolution-deadline: uint,
+    final-decision: (string-ascii 20),
+    arbitrator-count: uint
+  }
+)
+
+(define-map dispute-votes
+  { dispute-id: uint, arbitrator: principal }
+  {
+    vote: (string-ascii 20),
+    reasoning: (string-ascii 300),
+    voted-at: uint
+  }
+)
+
+(define-map arbitrators
+  { arbitrator: principal }
+  {
+    stake-amount: uint,
+    cases-resolved: uint,
+    reputation-score: uint,
+    is-active: bool,
+    registered-at: uint
+  }
+)
+
+(define-map dispute-arbitrator-assignments
+  { dispute-id: uint, arbitrator: principal }
+  { assigned-at: uint }
 )
 
 
@@ -337,5 +390,203 @@
 
 (define-read-only (get-total-bookings)
   (- (var-get next-booking-id) u1)
+)
+
+(define-public (register-arbitrator)
+  (let
+    (
+      (stake-required (var-get arbitrator-stake-required))
+    )
+    (try! (stx-transfer? stake-required tx-sender (as-contract tx-sender)))
+    (map-set arbitrators
+      { arbitrator: tx-sender }
+      {
+        stake-amount: stake-required,
+        cases-resolved: u0,
+        reputation-score: u100,
+        is-active: true,
+        registered-at: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (deregister-arbitrator)
+  (let
+    (
+      (arbitrator-data (unwrap! (map-get? arbitrators { arbitrator: tx-sender }) ERR_NOT_ARBITRATOR))
+    )
+    (asserts! (get is-active arbitrator-data) ERR_NOT_ARBITRATOR)
+    (try! (as-contract (stx-transfer? (get stake-amount arbitrator-data) tx-sender tx-sender)))
+    (map-set arbitrators
+      { arbitrator: tx-sender }
+      (merge arbitrator-data { is-active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (create-dispute (booking-id uint) (dispute-type (string-ascii 30)) (description (string-ascii 500)) (evidence-hash (string-ascii 64)))
+  (let
+    (
+      (booking (unwrap! (map-get? bookings { booking-id: booking-id }) ERR_BOOKING_NOT_FOUND))
+      (property (unwrap! (map-get? properties { property-id: (get property-id booking) }) ERR_PROPERTY_NOT_FOUND))
+      (dispute-id (var-get next-dispute-id))
+      (escrow-amount (get total-amount booking))
+      (respondent (if (is-eq tx-sender (get guest booking)) (get owner property) (get guest booking)))
+    )
+    (asserts! (or (is-eq tx-sender (get guest booking)) (is-eq tx-sender (get owner property))) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status booking) "confirmed") ERR_BOOKING_NOT_ACTIVE)
+    (asserts! (is-none (map-get? disputes { dispute-id: dispute-id })) ERR_DISPUTE_ALREADY_EXISTS)
+    (map-set disputes
+      { dispute-id: dispute-id }
+      {
+        booking-id: booking-id,
+        initiator: tx-sender,
+        respondent: respondent,
+        dispute-type: dispute-type,
+        description: description,
+        evidence-hash: evidence-hash,
+        status: "open",
+        escrow-amount: escrow-amount,
+        created-at: stacks-block-height,
+        resolution-deadline: (+ stacks-block-height u1440),
+        final-decision: "",
+        arbitrator-count: u0
+      }
+    )
+    (var-set next-dispute-id (+ dispute-id u1))
+    (ok dispute-id)
+  )
+)
+
+(define-public (submit-evidence (dispute-id uint) (evidence-hash (string-ascii 64)))
+  (let
+    (
+      (dispute (unwrap! (map-get? disputes { dispute-id: dispute-id }) ERR_DISPUTE_NOT_FOUND))
+    )
+    (asserts! (or (is-eq tx-sender (get initiator dispute)) (is-eq tx-sender (get respondent dispute))) ERR_NOT_DISPUTING_PARTY)
+    (asserts! (is-eq (get status dispute) "open") ERR_DISPUTE_NOT_OPEN)
+    (map-set disputes
+      { dispute-id: dispute-id }
+      (merge dispute { evidence-hash: evidence-hash })
+    )
+    (ok true)
+  )
+)
+
+(define-public (assign-arbitrator-to-dispute (dispute-id uint) (arbitrator principal))
+  (let
+    (
+      (dispute (unwrap! (map-get? disputes { dispute-id: dispute-id }) ERR_DISPUTE_NOT_FOUND))
+      (arbitrator-data (unwrap! (map-get? arbitrators { arbitrator: arbitrator }) ERR_NOT_ARBITRATOR))
+    )
+    (asserts! (is-eq (get status dispute) "open") ERR_DISPUTE_NOT_OPEN)
+    (asserts! (get is-active arbitrator-data) ERR_NOT_ARBITRATOR)
+    (asserts! (< (get arbitrator-count dispute) u3) ERR_INVALID_DISPUTE_STATUS)
+    (asserts! (is-none (map-get? dispute-arbitrator-assignments { dispute-id: dispute-id, arbitrator: arbitrator })) ERR_ALREADY_VOTED)
+    (map-set dispute-arbitrator-assignments
+      { dispute-id: dispute-id, arbitrator: arbitrator }
+      { assigned-at: stacks-block-height }
+    )
+    (map-set disputes
+      { dispute-id: dispute-id }
+      (merge dispute { arbitrator-count: (+ (get arbitrator-count dispute) u1) })
+    )
+    (ok true)
+  )
+)
+
+(define-public (vote-on-dispute (dispute-id uint) (vote (string-ascii 20)) (reasoning (string-ascii 300)))
+  (let
+    (
+      (dispute (unwrap! (map-get? disputes { dispute-id: dispute-id }) ERR_DISPUTE_NOT_FOUND))
+      (arbitrator-data (unwrap! (map-get? arbitrators { arbitrator: tx-sender }) ERR_NOT_ARBITRATOR))
+    )
+    (asserts! (is-eq (get status dispute) "open") ERR_DISPUTE_NOT_OPEN)
+    (asserts! (get is-active arbitrator-data) ERR_NOT_ARBITRATOR)
+    (asserts! (is-some (map-get? dispute-arbitrator-assignments { dispute-id: dispute-id, arbitrator: tx-sender })) ERR_NOT_ARBITRATOR)
+    (asserts! (is-none (map-get? dispute-votes { dispute-id: dispute-id, arbitrator: tx-sender })) ERR_ALREADY_VOTED)
+    (asserts! (< stacks-block-height (get resolution-deadline dispute)) ERR_BOOKING_NOT_ACTIVE)
+    (map-set dispute-votes
+      { dispute-id: dispute-id, arbitrator: tx-sender }
+      {
+        vote: vote,
+        reasoning: reasoning,
+        voted-at: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-private (count-votes-for-decision (dispute-id uint) (decision (string-ascii 20)))
+  u1
+)
+
+(define-public (resolve-dispute (dispute-id uint))
+  (let
+    (
+      (dispute (unwrap! (map-get? disputes { dispute-id: dispute-id }) ERR_DISPUTE_NOT_FOUND))
+      (booking (unwrap! (map-get? bookings { booking-id: (get booking-id dispute) }) ERR_BOOKING_NOT_FOUND))
+      (property (unwrap! (map-get? properties { property-id: (get property-id booking) }) ERR_PROPERTY_NOT_FOUND))
+      (initiator-favor-votes (count-votes-for-decision dispute-id "initiator"))
+      (respondent-favor-votes (count-votes-for-decision dispute-id "respondent"))
+      (final-decision (if (> initiator-favor-votes respondent-favor-votes) "initiator" "respondent"))
+    )
+    (asserts! (is-eq (get status dispute) "open") ERR_INVALID_DISPUTE_STATUS)
+    (asserts! (>= stacks-block-height (get resolution-deadline dispute)) ERR_BOOKING_NOT_ACTIVE)
+    (map-set disputes
+      { dispute-id: dispute-id }
+      (merge dispute { 
+        status: "resolved",
+        final-decision: final-decision
+      })
+    )
+    (if (is-eq final-decision "initiator")
+      (try! (as-contract (stx-transfer? (get escrow-amount dispute) tx-sender (get initiator dispute))))
+      (try! (as-contract (stx-transfer? (get escrow-amount dispute) tx-sender (get respondent dispute))))
+    )
+    (ok final-decision)
+  )
+)
+
+(define-public (update-arbitrator-reputation (arbitrator principal) (dispute-id uint))
+  (let
+    (
+      (arbitrator-data (unwrap! (map-get? arbitrators { arbitrator: arbitrator }) ERR_NOT_ARBITRATOR))
+      (dispute (unwrap! (map-get? disputes { dispute-id: dispute-id }) ERR_DISPUTE_NOT_FOUND))
+    )
+    (asserts! (is-eq (get status dispute) "resolved") ERR_INVALID_DISPUTE_STATUS)
+    (map-set arbitrators
+      { arbitrator: arbitrator }
+      (merge arbitrator-data { 
+        cases-resolved: (+ (get cases-resolved arbitrator-data) u1),
+        reputation-score: (+ (get reputation-score arbitrator-data) u10)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-dispute (dispute-id uint))
+  (map-get? disputes { dispute-id: dispute-id })
+)
+
+(define-read-only (get-dispute-vote (dispute-id uint) (arbitrator principal))
+  (map-get? dispute-votes { dispute-id: dispute-id, arbitrator: arbitrator })
+)
+
+(define-read-only (get-arbitrator (arbitrator principal))
+  (map-get? arbitrators { arbitrator: arbitrator })
+)
+
+(define-read-only (get-total-disputes)
+  (- (var-get next-dispute-id) u1)
+)
+
+(define-read-only (is-arbitrator-assigned (dispute-id uint) (arbitrator principal))
+  (is-some (map-get? dispute-arbitrator-assignments { dispute-id: dispute-id, arbitrator: arbitrator }))
 )
 
